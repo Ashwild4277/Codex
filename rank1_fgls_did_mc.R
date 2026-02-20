@@ -171,105 +171,64 @@ generate_data <- function(
   )
 }
 
-build_design_matrix <- function(dat, att_type = c("cohort_time")) {
+build_design_matrix <- function(dat, att_type = c("cohort_time", "lag")) {
   att_type <- match.arg(att_type)
-  if (att_type != "cohort_time") {
-    stop("Only att_type = 'cohort_time' is supported in this specification.")
-  }
-
   N <- dat$N
   TT <- dat$TT
-  n_obs <- N * TT
-  y <- dat$Y
   time <- dat$time
-  cohort_rep <- rep(dat$cohort, each = TT)
+
+  intercept <- rep(1, N * TT)
+  t_factor <- model.matrix(~ factor(time) - 1)
+  t_factor <- t_factor[, -1, drop = FALSE]
 
   X1_rep <- rep(dat$X1, each = TT)
   X2_rep <- rep(dat$X2, each = TT)
 
-  # Time FE: t2,...,tT (drop t1)
-  time_fe <- model.matrix(~ factor(time) - 1)
-  time_fe <- time_fe[, -1, drop = FALSE]
-  colnames(time_fe) <- paste0("t", 2:TT)
+  W <- cbind(intercept, t_factor, X1_rep, X2_rep)
+  colnames(W)[1] <- "intercept"
 
-  # Cohort FE over treated cohorts only; drop baseline (g=6)
-  treated_cohorts <- sort(unique(dat$treat_index$map[, "g"]))
-  g_baseline <- min(treated_cohorts)
-  cohort_levels <- setdiff(treated_cohorts, g_baseline)
-
-  cohort_fe_unit <- sapply(cohort_levels, function(g) as.numeric(dat$cohort == g))
-  if (is.null(dim(cohort_fe_unit))) {
-    cohort_fe_unit <- matrix(cohort_fe_unit, ncol = 1)
+  cohort_rep <- rep(dat$cohort, each = TT)
+  if (att_type == "cohort_time") {
+    idx_map <- dat$treat_index$map
+    z_cols <- matrix(0, nrow = N * TT, ncol = nrow(idx_map))
+    for (k in seq_len(nrow(idx_map))) {
+      g <- idx_map[k, "g"]
+      tt <- idx_map[k, "t"]
+      z_cols[, k] <- as.numeric((cohort_rep == g) & (time == tt))
+    }
+    colnames(z_cols) <- dat$treat_index$names
+    truth <- dat$true_att
+  } else {
+    max_lag <- dat$TT - min(dat$treat_index$map[, "g"])
+    lags <- 0:max_lag
+    z_cols <- matrix(0, nrow = N * TT, ncol = length(lags))
+    for (k in seq_along(lags)) {
+      ll <- lags[k]
+      z_cols[, k] <- as.numeric(is.finite(cohort_rep) & (time - cohort_rep == ll))
+    }
+    colnames(z_cols) <- paste0("ATT_lag", lags)
+    truth <- sapply(lags, function(ll) {
+      idx <- which(is.finite(dat$cohort))
+      if (length(idx) == 0L) return(NA_real_)
+      rows <- cbind(idx, dat$cohort[idx] + ll)
+      valid <- rows[, 2] >= 1 & rows[, 2] <= dat$TT
+      if (!any(valid)) return(NA_real_)
+      mean(dat$tau_mat[rows[valid, , drop = FALSE]])
+    })
+    names(truth) <- colnames(z_cols)
   }
-  colnames(cohort_fe_unit) <- paste0("g", cohort_levels)
-  cohort_fe <- cohort_fe_unit[rep(seq_len(N), each = TT), , drop = FALSE]
 
-  # Nuisance matrix W
-  intercept <- matrix(1, nrow = n_obs, ncol = 1, dimnames = list(NULL, "intercept"))
-  x_main <- cbind(x1 = X1_rep, x2 = X2_rep)
-
-  cohort_x1 <- cohort_fe * X1_rep
-  cohort_x2 <- cohort_fe * X2_rep
-  colnames(cohort_x1) <- paste0(colnames(cohort_fe), "_x1")
-  colnames(cohort_x2) <- paste0(colnames(cohort_fe), "_x2")
-
-  time_x1 <- time_fe * X1_rep
-  time_x2 <- time_fe * X2_rep
-  colnames(time_x1) <- paste0(colnames(time_fe), "_x1")
-  colnames(time_x2) <- paste0(colnames(time_fe), "_x2")
-
-  W <- cbind(intercept, time_fe, cohort_fe, x_main, cohort_x1, cohort_x2, time_x1, time_x2)
-
-  # Treatment matrix Z: post-treatment cohort x time indicators + covariate interactions
-  idx_map <- dat$treat_index$map
-  K <- nrow(idx_map)
-  Z_base <- matrix(0, nrow = n_obs, ncol = K)
-  z_names <- character(K)
-  for (k in seq_len(K)) {
-    g <- idx_map[k, "g"]
-    tt <- idx_map[k, "t"]
-    Z_base[, k] <- as.numeric((cohort_rep == g) & (time == tt))
-    z_names[k] <- paste0("ATT_g", g, "_t", tt)
-  }
-  colnames(Z_base) <- z_names
-
-  Z_x1 <- Z_base * X1_rep
-  Z_x2 <- Z_base * X2_rep
-  colnames(Z_x1) <- paste0(z_names, "_x1")
-  colnames(Z_x2) <- paste0(z_names, "_x2")
-
-  Z <- cbind(Z_base, Z_x1, Z_x2)
-
-  # Truth vectors aligned with treatment cells and treatment interactions
-  true_base <- dat$true_att[z_names]
-  names(true_base) <- z_names
-  true_x1 <- setNames(rep(NA_real_, K), paste0(z_names, "_x1"))
-  true_x2 <- setNames(rep(NA_real_, K), paste0(z_names, "_x2"))
-  true_treat <- c(true_base, true_x1, true_x2)
-
-  X <- cbind(W, Z)
-
-  stopifnot(
-    nrow(X) == length(y),
-    all(is.finite(X)),
-    all(is.finite(y)),
-    qr(W)$rank == ncol(W)
-  )
-
+  X <- cbind(W, z_cols)
   list(
-    y = y,
+    y = dat$Y,
     X = X,
     W = W,
-    Z = Z,
-    treat_names = colnames(Z),
-    true_treat = true_treat,
-    true_treat_base = true_base,
-    true_treat_x1 = true_x1,
-    true_treat_x2 = true_x2,
+    Z = z_cols,
+    treat_names = colnames(z_cols),
+    true_treat = truth,
     has_intercept = any(colnames(W) == "intercept")
   )
 }
-
 
 estimate_ols_residuals <- function(y, X) {
   fit <- lm.fit(x = X, y = y)
@@ -380,7 +339,7 @@ run_one_rep <- function(
     N = 1000L,
     TT = 10L,
     seed = NULL,
-    att_type = c("cohort_time"),
+    att_type = c("cohort_time", "lag"),
     a_method = c("grid", "adaptive"),
     tol_invariance = 1e-8,
     kappa_threshold = 1e8) {
@@ -502,7 +461,7 @@ run_mc <- function(
     N = 1000L,
     TT = 10L,
     seed = 123,
-    att_type = c("cohort_time"),
+    att_type = c("cohort_time", "lag"),
     a_method = c("grid", "adaptive"),
     progress_every = 50L,
     tol_invariance = 1e-8,
